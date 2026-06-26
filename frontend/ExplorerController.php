@@ -41,7 +41,7 @@ class ExplorerController extends Controller
     }
 
     /**
-     * Редактирование файла
+     * Редактирование файла с AJAX сохранением
      */
     public function actionEdit()
     {
@@ -57,23 +57,9 @@ class ExplorerController extends Controller
             return $this->renderError("Нет прав на запись в файл: " . $fullPath);
         }
 
-        // Обработка сохранения файла
-        if (Yii::$app->request->isPost) {
-            $content = Yii::$app->request->post('content');
-            if (file_put_contents($fullPath, $content) !== false) {
-                Yii::$app->session->setFlash('success', 'Файл успешно сохранён!');
-            } else {
-                Yii::$app->session->setFlash('error', 'Ошибка при сохранении файла!');
-            }
-            return $this->redirect(['index', 'path' => $path]);
-        }
-
         // Получаем содержимое файла
         $content = file_get_contents($fullPath);
         $extension = pathinfo($fullPath, PATHINFO_EXTENSION);
-        $language = $this->getLanguageByExtension($extension);
-
-        // Определяем тип файла для отображения
         $isBinary = $this->isBinaryFile($fullPath);
 
         $html = $this->renderHeader();
@@ -83,7 +69,8 @@ class ExplorerController extends Controller
                             <div class="sql-editor">
                                 <h2>✏️ Редактирование файла</h2>
                                 <p><strong>Файл:</strong> ' . htmlspecialchars($path) . '</p>
-                                <p><strong>Размер:</strong> ' . $this->formatFileSize(filesize($fullPath)) . '</p>';
+                                <p><strong>Размер:</strong> ' . $this->formatFileSize(filesize($fullPath)) . '</p>
+                                <div id="save-status"></div>';
 
         if ($isBinary) {
             $html .= '<div class="alert alert-warning">
@@ -91,7 +78,8 @@ class ExplorerController extends Controller
                         </div>';
         }
 
-        $html .= '<form action="' . Yii::$app->urlManager->createUrl(['explorer/edit', 'path' => $path]) . '" method="post">
+        $html .= '<form id="edit-form">
+                            <input type="hidden" name="path" value="' . htmlspecialchars($path) . '">
                             ' . Yii::$app->request->getCsrfTokenFromHeader() . '
                             <div class="form-group">
                                 <textarea 
@@ -105,8 +93,11 @@ class ExplorerController extends Controller
             '</textarea>
                             </div>
                             <div class="btn-group">
-                                <button type="submit" class="btn btn-primary">
+                                <button type="button" id="save-btn" class="btn btn-primary">
                                     <span class="glyphicon glyphicon-save"></span> 💾 Сохранить
+                                </button>
+                                <button type="button" id="save-close-btn" class="btn btn-success">
+                                    💾 Сохранить и закрыть
                                 </button>
                                 <a href="' . Yii::$app->urlManager->createUrl(['explorer', 'path' => dirname($path)]) . '" class="btn btn-default">
                                     ← Назад
@@ -118,8 +109,183 @@ class ExplorerController extends Controller
                 </div>
             </div>';
 
+        $html .= $this->renderEditScript($path);
         $html .= $this->renderFooter();
         return $html;
+    }
+
+    /**
+     * AJAX сохранение файла
+     */
+    public function actionSaveFile()
+    {
+        Yii::$app->response->format = Response::FORMAT_JSON;
+
+        $path = Yii::$app->request->post('path');
+        $content = Yii::$app->request->post('content');
+        $closeAfterSave = Yii::$app->request->post('close_after_save', false);
+
+        if (empty($path)) {
+            return [
+                'success' => false,
+                'error' => 'Путь к файлу не указан'
+            ];
+        }
+
+        $fullPath = $this->getFullPath($path);
+
+        if (!file_exists($fullPath) || !is_file($fullPath)) {
+            return [
+                'success' => false,
+                'error' => 'Файл не найден'
+            ];
+        }
+
+        if (!is_writable($fullPath)) {
+            return [
+                'success' => false,
+                'error' => 'Нет прав на запись в файл'
+            ];
+        }
+
+        // Создаем резервную копию
+        $backupPath = $fullPath . '.backup.' . date('Y-m-d_H-i-s');
+        copy($fullPath, $backupPath);
+
+        // Сохраняем файл
+        if (file_put_contents($fullPath, $content) !== false) {
+            return [
+                'success' => true,
+                'message' => 'Файл успешно сохранён!',
+                'close_after_save' => (bool)$closeAfterSave,
+                'backup_path' => basename($backupPath)
+            ];
+        } else {
+            return [
+                'success' => false,
+                'error' => 'Ошибка при сохранении файла'
+            ];
+        }
+    }
+
+    /**
+     * JavaScript для AJAX редактирования
+     */
+    private function renderEditScript($path)
+    {
+        $saveUrl = Yii::$app->urlManager->createUrl(['explorer/save-file']);
+        $redirectUrl = Yii::$app->urlManager->createUrl(['explorer', 'path' => dirname($path)]);
+
+        return <<<JS
+        <script>
+            document.addEventListener('DOMContentLoaded', function() {
+                const saveBtn = document.getElementById('save-btn');
+                const saveCloseBtn = document.getElementById('save-close-btn');
+                const content = document.getElementById('content');
+                const saveStatus = document.getElementById('save-status');
+                
+                // Получаем CSRF токен
+                const csrfToken = document.querySelector('input[name="_csrf"]')?.value || '';
+                
+                function showStatus(message, isSuccess) {
+                    const alertClass = isSuccess ? 'alert-success' : 'alert-danger';
+                    const icon = isSuccess ? '✅' : '❌';
+                    saveStatus.innerHTML = '<div class="alert ' + alertClass + ' alert-dismissible" style="margin-top: 10px;">' +
+                        '<button type="button" class="close" data-dismiss="alert">&times;</button>' +
+                        '<strong>' + icon + ' ' + message + '</strong>' +
+                        '</div>';
+                    
+                    // Автоскрытие через 5 секунд
+                    setTimeout(function() {
+                        const alerts = saveStatus.querySelectorAll('.alert');
+                        alerts.forEach(function(alert) {
+                            alert.style.transition = 'opacity 0.5s';
+                            alert.style.opacity = '0';
+                            setTimeout(function() {
+                                alert.remove();
+                            }, 500);
+                        });
+                    }, 5000);
+                }
+                
+                function saveFile(closeAfterSave) {
+                    // Получаем содержимое
+                    const contentValue = content.value;
+                    
+                    // Создаем FormData
+                    const formData = new FormData();
+                    formData.append('path', '{$path}');
+                    formData.append('content', contentValue);
+                    formData.append('close_after_save', closeAfterSave ? '1' : '0');
+                    formData.append('_csrf', csrfToken);
+                    
+                    // Отключаем кнопки во время сохранения
+                    saveBtn.disabled = true;
+                    saveCloseBtn.disabled = true;
+                    saveBtn.innerHTML = '⏳ Сохранение...';
+                    saveCloseBtn.innerHTML = '⏳ Сохранение...';
+                    
+                    fetch('{$saveUrl}', {
+                        method: 'POST',
+                        body: formData,
+                        headers: {
+                            'Accept': 'application/json',
+                            'X-Requested-With': 'XMLHttpRequest'
+                        }
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        // Включаем кнопки обратно
+                        saveBtn.disabled = false;
+                        saveCloseBtn.disabled = false;
+                        saveBtn.innerHTML = '<span class="glyphicon glyphicon-save"></span> 💾 Сохранить';
+                        saveCloseBtn.innerHTML = '💾 Сохранить и закрыть';
+                        
+                        if (data.success) {
+                            showStatus(data.message || 'Файл успешно сохранён!', true);
+                            
+                            // Редирект только если close_after_save = true
+                            if (data.close_after_save === true) {
+                                setTimeout(function() {
+                                    window.location.href = '{$redirectUrl}';
+                                }, 500);
+                            }
+                        } else {
+                            showStatus(data.error || 'Ошибка при сохранении файла', false);
+                        }
+                    })
+                    .catch(error => {
+                        saveBtn.disabled = false;
+                        saveCloseBtn.disabled = false;
+                        saveBtn.innerHTML = '<span class="glyphicon glyphicon-save"></span> 💾 Сохранить';
+                        saveCloseBtn.innerHTML = '💾 Сохранить и закрыть';
+                        showStatus('Ошибка: ' + error.message, false);
+                        console.error('Fetch error:', error);
+                    });
+                }
+                
+                // Обработчик для кнопки "Сохранить"
+                saveBtn.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    saveFile(false);
+                });
+                
+                // Обработчик для кнопки "Сохранить и закрыть"
+                saveCloseBtn.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    saveFile(true);
+                });
+                
+                // Ctrl+S для сохранения
+                document.addEventListener('keydown', function(e) {
+                    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+                        e.preventDefault();
+                        saveFile(false);
+                    }
+                });
+            });
+        </script>
+JS;
     }
 
     /**
@@ -619,6 +785,12 @@ class ExplorerController extends Controller
                 .table td { vertical-align: middle; }
                 pre { max-height: 600px; overflow: auto; }
                 .btn-group-xs > .btn { font-size: 12px; padding: 1px 5px; }
+                #save-status {
+                    margin-top: 10px;
+                }
+                textarea {
+                    resize: vertical;
+                }
             </style>
         </head>
         <body>';
